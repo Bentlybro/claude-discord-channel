@@ -1,0 +1,222 @@
+#!/usr/bin/env python3
+"""Where the bot hears EVERY message, not only @mentions -- and why that is not where it talks.
+
+    discord-listen add <channel-or-thread-id> "<why>"   the owner asked: listen there (never expires)
+    discord-listen remove <id>                          stop, restoring exactly what was there
+    discord-listen list                                 where, why, and until when
+    discord-listen follow                               run by the watcher service every pass
+
+Two ways a place is listened to:
+
+  * the owner names it (`add`). Only on their word, per place. A busy channel wakes the agent on
+    every message, so prefer a thread.
+  * A person started a conversation with the bot (`follow`, automatic): @mentioned it or replied to
+    it, in a thread or a channel. The patched plugin records that in engaged.json, and every reply
+    the bot sends there renews it. `follow` listens there until 24 h (thread) or 30 min (channel)
+    after the bot was last part of it, then the place is back to mention-only. (2026-09-24)
+    people "have to properly reply/@ dispatch every time"; it should listen "for a while" and stop
+    when the conversation no longer needs it.) `remove` ends one early.
+
+Listening is not being spoken to. Each message that arrives only because of a listen is tagged
+`addressed="no"` by the patched plugin, with no 👀 and no typing indicator. The agent replies
+there only when (a) it is @mentioned or replied to, (b) asked a direct question it can truthfully
+answer, or (c) the owner told it to act there. Otherwise it reads, notes owners and decisions in
+dispatch-memory, and stays quiet.
+
+This tool owns only entries marked `"listen": true`. It never changes `"ours": true` entries
+(your own tooling owns those) or entries set by hand; over an existing entry it flips requireMention
+only and remembers the rest, and `remove` or an expiry restores exactly what was there. Who may
+speak follows the server scoping: anyone in the team's server, the owner only elsewhere. Every write
+is atomic: the plugin reads access.json on every message, and half a file makes it start over with
+no channels at all.
+"""
+from __future__ import annotations
+
+import json
+import os
+import pathlib
+import sys
+import time
+import urllib.request
+
+STATE_DIR = pathlib.Path(os.environ.get("DISCORD_STATE_DIR", str(pathlib.Path.home() / ".claude/channels/discord")))
+ACCESS = STATE_DIR / "access.json"
+ENGAGED = STATE_DIR / "engaged.json"
+ENV = STATE_DIR / ".env"
+UA = "DiscordBot (https://github.com/Bentlybro/claude-discord-channel, 1.0)"
+# Settings (environment): DISCORD_HOME_GUILD = your team's server, where anyone may talk to the bot;
+# DISCORD_OWNER_ID = the person the bot works for, the only one who may address it anywhere else.
+HOME_GUILD = os.environ.get("DISCORD_HOME_GUILD", "")
+OWNER = os.environ.get("DISCORD_OWNER_ID", "")
+THREADS = {10, 11, 12}
+# How long a conversation stays open after the bot was last part of it (addressed, or replied there).
+# Channels are short: a busy channel wakes the agent on every message.
+FOLLOW_THREAD_S = 24 * 3600
+FOLLOW_CHANNEL_S = 30 * 60
+FORGET_ENGAGED_DAYS = 30
+
+
+def channel_info(cid: str) -> dict:
+    if os.environ.get("DISCORD_LISTEN_FAKE"):            # tests only: no Discord call
+        return json.loads(os.environ["DISCORD_LISTEN_FAKE"])
+    tok = next(l.split("=", 1)[1].strip().strip("'\"") for l in ENV.read_text().splitlines()
+               if l.startswith("DISCORD_BOT_TOKEN="))
+    req = urllib.request.Request(f"https://discord.com/api/v10/channels/{cid}",
+                                 headers={"Authorization": f"Bot {tok}", "User-Agent": UA})
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        return json.loads(resp.read())
+
+
+def load(path: pathlib.Path, default):
+    try:
+        return json.loads(path.read_text())
+    except (OSError, ValueError):
+        return default
+
+
+def save(path: pathlib.Path, data) -> None:
+    tmp = path.with_name(path.name + ".listen.tmp")
+    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+    tmp.replace(path)
+
+
+def start(groups: dict, cid: str, guild: str, name: str, why: str, *, auto: bool, until: float | None) -> str:
+    """Listen to cid. Returns what happened: listening, updated, ours, already."""
+    entry = groups.get(cid)
+    if entry and entry.get("ours"):
+        return "ours"
+    if entry and entry.get("listen"):
+        if auto and entry.get("listen_auto") and until and until > float(entry.get("listen_until") or 0):
+            entry["listen_until"] = until                # a new mention extends an automatic follow
+            return "updated"
+        return "already"
+    new = dict(entry or {})
+    new["requireMention"] = False
+    if not entry:
+        if not OWNER:
+            sys.exit("discord-listen: set DISCORD_OWNER_ID (and DISCORD_HOME_GUILD) first: see README")
+        new["allowFrom"] = [] if guild == HOME_GUILD else [OWNER]
+    new.update({"listen": True, "listen_why": why[:200], "listen_name": name[:100],
+                "listen_since": time.strftime("%Y-%m-%d %H:%M"), "listen_before": entry and dict(entry)})
+    if auto:
+        new["listen_auto"] = True
+        new["listen_until"] = until
+    groups[cid] = new
+    return "listening"
+
+
+def stop(groups: dict, cid: str) -> None:
+    before = groups[cid].get("listen_before")
+    if before is None:
+        del groups[cid]
+    else:
+        groups[cid] = before
+
+
+def add(cid: str, why: str) -> int:
+    info = channel_info(cid)
+    guild = str(info.get("guild_id") or "")
+    if not guild:
+        print("refusing: not a server channel or thread (DMs are handled by dmPolicy)")
+        return 2
+    access = load(ACCESS, None)
+    if access is None:
+        print("refusing: access.json is missing or unreadable")
+        return 2
+    groups = access.setdefault("groups", {})
+    entry = groups.get(cid) or {}
+    if entry.get("listen_auto"):                         # the owner naming it makes it permanent
+        entry.pop("listen_auto", None)
+        entry.pop("listen_until", None)
+        entry["listen_why"] = why[:200]
+        save(ACCESS, access)
+        print(f"now listening to {entry.get('listen_name', cid)} ({cid}) for good, not just while following it")
+        return 0
+    what = start(groups, cid, guild, str(info.get("name") or cid), why, auto=False, until=None)
+    if what == "ours":
+        print(f"{cid} is one of our own threads: every message is already delivered")
+        return 0
+    if what == "already":
+        print(f"already listening to {cid}")
+        return 0
+    save(ACCESS, access)
+    kind = "thread" if info.get("type") in THREADS else "channel (every message will wake the agent)"
+    print(f"listening to {kind} {groups[cid]['listen_name']} ({cid}). Messages there arrive tagged "
+          f"addressed=\"no\" unless the bot is mentioned")
+    return 0
+
+
+def remove(cid: str) -> int:
+    access = load(ACCESS, {})
+    groups = access.get("groups") or {}
+    entry = groups.get(cid)
+    if not entry or not entry.get("listen"):
+        print(f"not listening to {cid} (only entries added by discord-listen can be removed here)")
+        return 2
+    stop(groups, cid)
+    save(ACCESS, access)
+    engaged = load(ENGAGED, {})
+    if engaged.pop(cid, None) is not None:               # or `follow` would start again at once
+        save(ENGAGED, engaged)
+    print(f"stopped listening to {entry.get('listen_name', cid)} ({cid})")
+    return 0
+
+
+def follow(now: float | None = None) -> int:
+    """Follow conversations the bot is part of; drop them 24 h (thread) or 30 min (channel) after it last was."""
+    now = now or time.time()
+    access = load(ACCESS, None)
+    if access is None:
+        return 0
+    groups = access.setdefault("groups", {})
+    engaged = load(ENGAGED, {})
+    changed = False
+    for cid, seen in list(engaged.items()):
+        at = float((seen or {}).get("at") or 0) / 1000   # the plugin writes milliseconds
+        if now - at > FORGET_ENGAGED_DAYS * 86400:
+            engaged.pop(cid)
+            continue
+        channel = seen.get("kind") == "channel"
+        until = at + (FOLLOW_CHANNEL_S if channel else FOLLOW_THREAD_S)
+        if until <= now:
+            continue
+        what = start(groups, cid, str(seen.get("guild") or ""), str(seen.get("name") or cid),
+                     "following: a conversation the bot is part of (stops "
+                     + ("30 min" if channel else "24 h") + " after it last was)", auto=True, until=until)
+        changed |= what in ("listening", "updated")
+    for cid, entry in list(groups.items()):
+        if entry.get("listen_auto") and float(entry.get("listen_until") or 0) <= now:
+            stop(groups, cid)
+            changed = True
+    if changed:
+        save(ACCESS, access)
+    save(ENGAGED, engaged) if engaged != load(ENGAGED, {}) else None
+    return 0
+
+
+def listing() -> int:
+    rows = [(cid, e) for cid, e in (load(ACCESS, {}).get("groups") or {}).items() if e.get("listen")]
+    if not rows:
+        print("not listening anywhere beyond @mentions, our own threads and the bot's own channel")
+    for cid, e in rows:
+        until = (f"following until {time.strftime('%Y-%m-%d', time.gmtime(float(e['listen_until'])))}"
+                 if e.get("listen_auto") else "until removed")
+        print(f"{cid}  {e.get('listen_name', '?')}  {until}  — {e.get('listen_why', '')}")
+    return 0
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) >= 4 and argv[1] == "add":
+        return add(argv[2], " ".join(argv[3:]))
+    if len(argv) == 3 and argv[1] == "remove":
+        return remove(argv[2])
+    if len(argv) == 2 and argv[1] == "list":
+        return listing()
+    if len(argv) == 2 and argv[1] == "follow":
+        return follow()
+    print("usage: discord-listen add <id> \"<why>\" | remove <id> | list | follow", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv))

@@ -1,0 +1,15 @@
+Modified from the Claude Code Discord channel plugin (discord@claude-plugins-official, v0.0.4),
+Copyright Anthropic, licensed under the Apache License 2.0 (LICENSE).
+
+Changes, all in plugin/server.ts and marked "PATCHED(dispatch)" (see README.md and
+patches/upstream-to-patched.diff):
+   1. a role ping is not addressed
+   2. access.json: a thread's own entry is read before its parent channel's
+   3. messages not addressed to the bot are tagged addressed="no" (no ack reaction, no typing indicator)
+   4. other bots and webhooks are delivered only when allowlisted; no bot-to-bot reply loops
+   5. bare PR numbers become links (when DISCORD_PR_REPO is set)
+   6. a conversation stays open while the bot is in it (engaged.json)
+   7. bot replies are rare (time-limited, logged reply windows)
+   8. a forwarded message arrives with its text
+   9. long replies split at words; files go with the last part
+  10. a signed bot message listed in on_behalf.json is treated as its person asking

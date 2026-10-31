@@ -1,0 +1,161 @@
+#!/usr/bin/env python3
+"""Which other bots the bot reads on Discord, and where it may answer one.
+
+    discord-bots list                                   who is read, and any reply overrides
+    discord-bots allow <bot-or-webhook-id> "<name>"     read this bot (still through the normal gate)
+    discord-bots remove <id>                            stop reading it
+    discord-bots open-reply <chat-id> <minutes> "<why>" the bot itself, when confident and relevant: max 10 min
+    discord-bots allow-reply <chat-id> <minutes>        on the owner's explicit word: longer windows
+    discord-bots log                                    every window opened, and why
+    discord-bots revoke-reply <chat-id>
+
+The stock Discord plugin dropped every bot message, so another bot confirming a bug in the v0.8.1
+release thread never reached the bot (2026-09-23). The patched plugin (bin/patch-plugin) now
+delivers another bot's message when its id is listed here, through the same gate as a human
+(@mention, reply, listened place, our threads), tagged author_is_bot="yes". the bot's own
+messages are never delivered, whatever this file says.
+
+An allowlist, not all bots: every bot delivered is a stream of text from something that is not a
+person -- notification bots, spam, and any agent whose output can carry imperative text. Listing
+the ones worth reading keeps the injection surface and the loop risk to bots the owner chose.
+Webhooks are listed by their webhook id (it is the author id of their messages).
+
+No loops: the patched reply tool refuses to answer a bot (reply_to a bot's message) or to post
+where a bot spoke last in the past 3 minutes, unless `allow-reply` set an override for that chat.
+That override exists for when the owner says "answer another bot there"; it expires by itself.
+"""
+from __future__ import annotations
+
+import json
+import os
+import pathlib
+import sys
+import time
+
+STATE_DIR = pathlib.Path(os.environ.get("DISCORD_STATE_DIR", str(pathlib.Path.home() / ".claude/channels/discord")))
+BOTS = STATE_DIR / "bots.json"
+SELF = os.environ.get("DISCORD_BOT_ID", "")   # this bot itself: never listed, never delivered
+MAX_REPLY_MINUTES = 24 * 60
+# (2026-09-24) "every now and then, only if responsable, you can interact with the team and
+# autopwuts but like, never go over the top". So the bot may open a window itself -- short, a few an
+# hour, and every one logged where the owner can read it. The plugin still allows one reply per bot message
+# and 3 bot replies per chat per hour, whoever opened the window.
+SELF_MAX_MINUTES = 10
+SELF_OPENS_PER_HOUR = 3
+LOG = pathlib.Path(os.environ.get("DISCORD_BOTS_LOG", str(STATE_DIR / "bot-replies.log")))
+
+
+def log_window(chat: str, minutes: int, who: str, why: str) -> None:
+    LOG.parent.mkdir(parents=True, exist_ok=True)
+    with open(LOG, "a") as fh:
+        fh.write(json.dumps({"at": time.strftime("%Y-%m-%d %H:%M:%S"), "ts": time.time(), "chat": chat,
+                             "minutes": minutes, "by": who, "why": why[:300]}) + "\n")
+
+
+def opens_last_hour(chat: str) -> int:
+    try:
+        rows = [json.loads(l) for l in LOG.read_text().splitlines() if l.strip()]
+    except OSError:
+        return 0
+    return sum(1 for r in rows if r.get("chat") == chat and r.get("by") == "dispatch"
+               and time.time() - float(r.get("ts", 0)) < 3600)
+
+
+def load() -> dict:
+    try:
+        data = json.loads(BOTS.read_text())
+    except (OSError, ValueError):
+        data = {}
+    data.setdefault("allow", {})
+    data.setdefault("reply_ok", {})
+    return data
+
+
+def save(data: dict) -> None:
+    data["reply_ok"] = {k: v for k, v in data["reply_ok"].items() if float(v) > time.time()}
+    week = (time.time() - 7 * 86400) * 1000            # the plugin's reply records are in milliseconds
+    data["answered"] = {k: v for k, v in (data.get("answered") or {}).items() if float(v) > week}
+    data["replied"] = {k: [t for t in v if float(t) > week] for k, v in (data.get("replied") or {}).items()}
+    tmp = BOTS.with_name("bots.json.tmp")
+    tmp.write_text(json.dumps(data, indent=2) + "\n")
+    tmp.replace(BOTS)                  # the plugin reads this on every bot message
+
+
+def main(argv: list[str]) -> int:
+    data = load()
+    if len(argv) >= 4 and argv[1] == "allow":
+        bid = argv[2]
+        if not bid.isdigit():
+            print("refusing: a Discord id is digits")
+            return 2
+        if bid == SELF:
+            print("refusing: that is the bot itself; its own messages are never delivered")
+            return 2
+        data["allow"][bid] = " ".join(argv[3:])[:80]
+        save(data)
+        print(f"reading bot {data['allow'][bid]} ({bid}), through the normal gate, tagged author_is_bot")
+        return 0
+    if len(argv) == 3 and argv[1] == "remove":
+        if data["allow"].pop(argv[2], None) is None:
+            print(f"{argv[2]} is not listed")
+            return 2
+        save(data)
+        print(f"no longer reading {argv[2]}")
+        return 0
+    if len(argv) >= 5 and argv[1] == "open-reply":
+        try:
+            minutes = int(argv[3])
+        except ValueError:
+            minutes = 0
+        why = " ".join(argv[4:]).strip()
+        if not argv[2].isdigit() or not 1 <= minutes <= SELF_MAX_MINUTES or len(why) < 8:
+            print(f"usage: open-reply <chat-id> <minutes 1..{SELF_MAX_MINUTES}> \"<why this reply is relevant>\"")
+            return 2
+        if opens_last_hour(argv[2]) >= SELF_OPENS_PER_HOUR:
+            print(f"refusing: {SELF_OPENS_PER_HOUR} windows opened in this chat in the past hour already. "
+                  "That is over the top: stay quiet here, or ask the owner")
+            return 3
+        data["reply_ok"][argv[2]] = int(time.time() + minutes * 60)
+        save(data)
+        log_window(argv[2], minutes, "dispatch", why)
+        print(f"may answer bots in {argv[2]} for {minutes} min: one reply per bot message, 3 an hour (logged)")
+        return 0
+    if len(argv) == 2 and argv[1] == "log":
+        try:
+            print(LOG.read_text().rstrip() or "no windows opened")
+        except OSError:
+            print("no windows opened")
+        return 0
+    if len(argv) == 4 and argv[1] == "allow-reply":
+        try:
+            minutes = int(argv[3])
+        except ValueError:
+            minutes = 0
+        if not argv[2].isdigit() or not 1 <= minutes <= MAX_REPLY_MINUTES:
+            print(f"usage: allow-reply <chat-id> <minutes 1..{MAX_REPLY_MINUTES}>")
+            return 2
+        data["reply_ok"][argv[2]] = int(time.time() + minutes * 60)
+        save(data)
+        log_window(argv[2], minutes, "bently's word", "allow-reply")
+        print(f"may answer bots in {argv[2]} for {minutes} min (on the owner's word; logged)")
+        return 0
+    if len(argv) == 3 and argv[1] == "revoke-reply":
+        data["reply_ok"].pop(argv[2], None)
+        save(data)
+        print(f"no longer answers bots in {argv[2]}")
+        return 0
+    if len(argv) == 2 and argv[1] == "list":
+        for bid, name in data["allow"].items():
+            print(f"read  {bid}  {name}")
+        for chat, until in data["reply_ok"].items():
+            if float(until) > time.time():
+                print(f"reply {chat}  until {time.strftime('%H:%M UTC', time.gmtime(float(until)))}")
+        if not data["allow"]:
+            print("no other bots are read")
+        return 0
+    print(__doc__.strip().splitlines()[2:7] and "\n".join(__doc__.strip().splitlines()[2:7]), file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv))
